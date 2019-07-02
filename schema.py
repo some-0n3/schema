@@ -2,6 +2,7 @@
 obtained from config-files, forms, external services or command-line
 parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
+from functools import wraps
 import re
 
 try:
@@ -9,7 +10,7 @@ try:
 except ImportError:
     from contextlib2 import ExitStack
 
-__version__ = "0.6.8"
+__version__ = "0.7.0"
 __all__ = [
     "Schema",
     "And",
@@ -19,6 +20,7 @@ __all__ = [
     "Use",
     "Forbidden",
     "Const",
+    "Literal",
     "SchemaError",
     "SchemaWrongKeyError",
     "SchemaMissingKeyError",
@@ -93,6 +95,32 @@ class SchemaUnexpectedTypeError(SchemaError):
     pass
 
 
+def filter_refs(function):
+    @wraps(function)
+    def wrapper(self, *args, **kwargs):
+        use_refs = kwargs.get("use_refs")
+        seen = kwargs.get("seen")
+        result = function(self, *args, **kwargs)
+        if not use_refs:
+            return result
+
+        hashed = hash(repr(sorted(result.items())))
+        if hashed in seen:
+            definition, name = seen[hashed]
+            if "$id" not in definition:
+                definition["$id"] = "#" + name
+            return {"$ref": "#" + name}
+
+        seen[hashed] = result, str(hashed)
+        return result
+
+    # fix for python 2
+    if not hasattr(wrapper, "__wrapped__"):
+        wrapper.__wrapped__ = function
+
+    return wrapper
+
+
 def _merge_cls(base, extension):
     """Merge a basic `Schema` and an extension class."""
     if issubclass(extension, base):
@@ -102,7 +130,7 @@ def _merge_cls(base, extension):
 
 def _base_cls(cls):
     """Get the basic `Schema` class."""
-    extensions = (Iterable, Dictionary, Callable, Type, Value)
+    extensions = (Iterable, Dictionary, Callable, Type, Value, Literal)
     return next(c for c in cls.mro() if issubclass(c, Schema) and not issubclass(c, extensions))
 
 
@@ -143,24 +171,56 @@ class Schema(object):
         if flavor == CALLABLE:
             cls = _merge_cls(cls, Callable)
         if flavor == COMPARABLE:
-            cls = _merge_cls(cls, Value)
+            if issubclass(cls, Regex):
+                cls = _merge_cls(cls, Regex)
+            else:
+                cls = _merge_cls(cls, Value)
         return super(Schema, cls).__new__(cls)
 
-    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None):
+    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None, description=None, as_reference=False):
         if isinstance(schema, Schema) and _base_cls(type(schema)) == Schema:
             # remove empty schema wrappings (part 2)
             if not error or not schema._error:
                 error = error or schema._error
-                schema = schema._schema
+                ignore_extra_keys = ignore_extra_keys or schema.ignore_extra_keys
+                as_reference = as_reference or schema.as_reference
+                description = description or schema.description
+                name = name or schema.name
+                schema = schema.schema
         self._schema = schema
         self._error = error
         self._ignore_extra_keys = ignore_extra_keys
         self._name = name
+        self._description = description
+        # Ask json_schema to create a definition for this schema and use it as part of another
+        self.as_reference = as_reference
+        if as_reference and name is None:
+            raise ValueError("Schema used as reference should have a name")
 
     def __repr__(self):
         # hide `Iterable`, `Dictionary`, `Callable`, 'Type' and `Value`
         base = _base_cls(type(self))
         return "%s(%r)" % (base.__name__, self._schema)
+
+    @property
+    def schema(self):
+        return self._schema
+
+    @property
+    def description(self):
+        if self._description:
+            return self._description
+        if isinstance(self.schema, Schema):
+            return self.schema.description
+        return None
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def ignore_extra_keys(self):
+        return self._ignore_extra_keys
 
     @staticmethod
     def _dict_key_priority(s):
@@ -173,7 +233,7 @@ class Schema(object):
 
     @staticmethod
     def _is_optional_type(s):
-        """Return True if the given key is optional (does not have to be found"""
+        """Return True if the given key is optional (does not have to be found)"""
         return any(isinstance(s, optional_type) for optional_type in [Optional, Hook])
 
     def is_valid(self, data):
@@ -206,81 +266,34 @@ class Schema(object):
             message = self._prepend_schema_name(message)
             raise SchemaError(message, self._error.format(data) if self._error else None)
 
-    def json_schema(self, schema_id=None, is_main_schema=True):
-        """Generate a draft-07 JSON schema dict representing the Schema.
-        This method can only be called when the Schema's value is a dict.
-        This method must be called with a schema_id. Calling it without one
-        is used in a recursive context for sub schemas."""
-        Schema = self.__class__
-        constr = _base_cls(type(self))
-        s = self._schema
-        i = self._ignore_extra_keys
-        flavor = _priority(s)
+    @filter_refs
+    def _json_schema_(self, *args, **kwargs):
+        worker = self.schema
+        if isinstance(worker, Schema):
+            result = worker._json_schema_(*args, **kwargs)
+        else:
+            result = {}
+        if self.description:
+            result["description"] = self.description
+        return result
 
-        if flavor != DICT and is_main_schema:
-            raise ValueError("The main schema must be a dict.")
-
-        if flavor == TYPE:
-            # Handle type
-            return {"type": {int: "integer", float: "number", bool: "boolean"}.get(s, "string")}
-        elif flavor == ITERABLE and len(s) == 1:
-            # Handle arrays of a single type or dict schema
-            return {"type": "array", "items": constr(s[0]).json_schema(is_main_schema=False)}
-        elif isinstance(s, Or):
-            # Handle Or values
-            values = [constr(or_key).json_schema(is_main_schema=False) for or_key in s._args]
-            any_of = []
-            for value in values:
-                if value not in any_of:
-                    any_of.append(value)
-            return {"anyOf": any_of}
-
-        if flavor != DICT:
-            # If not handled, do not check
-            return {}
-
-        if is_main_schema and not schema_id:
-            raise ValueError("schema_id is required.")
-
-        # Handle dict
-        required_keys = []
-        expanded_schema = {}
-        for key in s:
-            if isinstance(key, Hook):
-                continue
-
-            if isinstance(s[key], Schema):
-                sub_schema = s[key]
-            else:
-                sub_schema = constr(s[key], ignore_extra_keys=i)
-            sub_schema_json = sub_schema.json_schema(is_main_schema=False)
-
-            is_optional = False
-            if isinstance(key, Optional):
-                key = key._schema
-                is_optional = True
-
-            if isinstance(key, str):
-                if not is_optional:
-                    required_keys.append(key)
-                expanded_schema[key] = sub_schema_json
-            elif isinstance(key, Or):
-                for or_key in key._args:
-                    expanded_schema[or_key] = sub_schema_json
-        schema_dict = {
-            "type": "object",
-            "properties": expanded_schema,
-            "required": required_keys,
-            "additionalProperties": i,
-        }
-        if is_main_schema:
-            schema_dict.update({"id": schema_id, "$schema": "http://json-schema.org/draft-07/schema#"})
-        return schema_dict
+    def json_schema(self, *args, **kwargs):
+        worker = self.schema
+        if isinstance(worker, Dictionary):
+            result = worker.json_schema(*args, **kwargs)
+            if self.description:
+                result["description"] = self.description
+            if self.name:
+                result["title"] = self.name
+            return result
+        raise ValueError()
 
 
 class Iterable(Schema):
-    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None):
-        super(Iterable, self).__init__(schema, error=error, ignore_extra_keys=ignore_extra_keys, name=name)
+    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None, description=None):
+        super(Iterable, self).__init__(
+            schema, error=error, ignore_extra_keys=ignore_extra_keys, name=name, description=description
+        )
         constr = _base_cls(type(self))
         self._iter_sub = constr(type(self._schema), error=self._error)
         self._elem_sub = Or(*self._schema, error=self._error, schema=constr, ignore_extra_keys=ignore_extra_keys)
@@ -290,10 +303,28 @@ class Iterable(Schema):
         val_func = self._elem_sub.validate
         return type(data)(val_func(d) for d in data)
 
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        result = super(Iterable, self)._json_schema_.__wrapped__(self, **kwargs)
+        result["type"] = "array"
+        schemas = self._elem_sub._schema_seq
+        if len(schemas) == 1:
+            result["items"] = schemas[0]._json_schema_(**kwargs)
+        elif len(schemas) > 1:
+            result["items"] = self._elem_sub._json_schema_(**kwargs)
+        return result
+
 
 class Dictionary(Schema):
-    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None):
-        super(Dictionary, self).__init__(schema, error=error, ignore_extra_keys=ignore_extra_keys, name=name)
+    def __init__(self, schema, error=None, ignore_extra_keys=False, name=None, description=None, as_reference=False):
+        super(Dictionary, self).__init__(
+            schema,
+            error=error,
+            ignore_extra_keys=ignore_extra_keys,
+            name=name,
+            description=description,
+            as_reference=as_reference,
+        )
         constr = _base_cls(type(self))
         schema = self._schema
         error = self._error
@@ -379,6 +410,70 @@ class Dictionary(Schema):
 
         return new
 
+    @filter_refs
+    def _json_schema_(self, allow_reference=True, refs=None, seen=None, **kwargs):
+        # Check if we have to create a common definition and use as reference
+        if allow_reference and self.as_reference:
+            # Generate sub schema if not already done
+            if self.name not in refs:
+                refs[self.name] = None
+                result = self._json_schema_(allow_reference=False, refs=refs, seen=seen, **kwargs)
+                refs[self.name] = result
+                hashed = hash(repr(sorted(result.items())))
+                seen[hashed] = result, self.name
+
+            return {"$ref": "#/definitions/" + self.name}
+
+        def _get_name(key):
+            """Get the name of a key (as specified in a Literal object). Return the key unchanged if not a Literal"""
+            if isinstance(key, Optional):
+                return _get_name(key.schema)
+
+            if isinstance(key, Literal):
+                return key.schema
+
+            return key
+
+        required_keys = []
+        expanded_schema = {}
+        for key, keyschema, valschema in self._sorted:
+            key_name = _get_name(key)
+            if isinstance(key_name, str):
+                if not isinstance(key, Optional):
+                    required_keys.append(key_name)
+                expanded_schema[key_name] = valschema._json_schema_(refs=refs, seen=seen, **kwargs)
+                if keyschema.description:
+                    expanded_schema[key_name]["description"] = keyschema.description
+            elif isinstance(key_name, Or):
+                # JSON schema does not support having a key named one name or another, so we just add both options
+                # This is less strict because we cannot enforce that one or the other is required
+                for or_key in key_name._schema_seq:
+                    name = _get_name(or_key.schema)
+                    expanded_schema[name] = valschema._json_schema_(refs=refs, seen=seen, **kwargs)
+                    if or_key.description:
+                        expanded_schema[name]["description"] = or_key.description
+
+        return_schema = {
+            "type": "object",
+            "properties": expanded_schema,
+            "required": required_keys,
+            "additionalProperties": self.ignore_extra_keys,
+        }
+        if self.description:
+            return_schema["description"] = self.description
+        return return_schema
+
+    def json_schema(self, schema_id, use_refs=False):
+        refs, seen = {}, {}
+        return_schema = self._json_schema_(refs=refs, seen=seen, use_refs=use_refs)
+        return_schema.update({"$id": schema_id, "$schema": "http://json-schema.org/draft-07/schema#"})
+        if self.name:
+            return_schema["title"] = self.name
+        if refs:
+            return_schema["definitions"] = dict(refs)
+
+        return return_schema
+
 
 class Type(Schema):
     def validate(self, data):
@@ -389,6 +484,25 @@ class Type(Schema):
         message = "%r should be instance of %r" % (data, s.__name__)
         message = self._prepend_schema_name(message)
         raise SchemaUnexpectedTypeError(message, e.format(data) if e else None)
+
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        result = super(Type, self)._json_schema_.__wrapped__(self, **kwargs)
+        if self.schema == str:
+            result["type"] = "string"
+        elif self.schema == int:
+            result["type"] = "integer"
+        elif self.schema == float:
+            result["type"] = "number"
+        elif self.schema == bool:
+            result["type"] = "boolean"
+        elif self.schema == list:
+            result["type"] = "array"
+        elif self.schema == dict:
+            result["type"] = "object"
+        else:
+            result["type"] = "string"
+        return result
 
 
 class Callable(Schema):
@@ -413,12 +527,21 @@ class Callable(Schema):
 
 class Value(Schema):
     def validate(self, data):
-        if self._schema == data:
+        schema = self.schema
+        if isinstance(schema, Literal):
+            schema = schema.schema
+        if schema == data:
             return data
         e = self._error
-        message = "%r does not match %r" % (self._schema, data)
+        message = "%r does not match %r" % (schema, data)
         message = self._prepend_schema_name(message)
         raise SchemaError(message, e.format(data) if e else None)
+
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        result = super(Value, self)._json_schema_.__wrapped__(self, **kwargs)
+        result["const"] = str(self.schema)
+        return result
 
 
 class And(Schema):
@@ -441,9 +564,15 @@ class And(Schema):
         self._schema = schema = kw.get("schema", Schema)
         self._schema_seq = [schema(a, error=error, ignore_extra_keys=ignore) for a in args]
         self._name = kw.get("name", None)
+        self._description = kw.get("description", None)
 
     def __repr__(self):
         return "%s(%s)" % (self.__class__.__name__, ", ".join(repr(a) for a in self._args))
+
+    @property
+    def args(self):
+        """The provided parameters"""
+        return self._args
 
     def validate(self, data):
         """
@@ -455,6 +584,17 @@ class And(Schema):
         for s in self._schema_seq:
             data = s.validate(data)
         return data
+
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        return_schema = {}
+        all_of_values = []
+        for and_key in self._schema_seq:
+            and_key = and_key._json_schema_(**kwargs)
+            if and_key != {} and and_key not in all_of_values:
+                all_of_values.append(and_key)
+        return_schema["allOf"] = all_of_values
+        return return_schema
 
 
 class Or(And):
@@ -494,6 +634,27 @@ class Or(And):
             [self._error.format(data) if self._error else None] + errors,
         )
 
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        return_schema = {}
+        # Check if we can use an enum
+        if all(priority == COMPARABLE for priority in [_priority(value) for value in self.args]):
+            or_values = [str(s) if isinstance(s, Literal) else s for s in self.args]
+            # All values are simple, can use enum or const
+            if len(or_values) == 1:
+                return_schema["const"] = or_values[0]
+                return return_schema
+            return_schema["enum"] = or_values
+        else:
+            # No enum, let's go with recursive calls
+            any_of_values = []
+            for or_key in self._schema_seq:
+                or_key = or_key._json_schema_(**kwargs)
+                if or_key not in any_of_values:
+                    any_of_values.append(or_key)
+            return_schema["anyOf"] = any_of_values
+        return return_schema
+
 
 class Regex(Schema):
     """
@@ -513,7 +674,7 @@ class Regex(Schema):
         "re.TEMPLATE",
     ]
 
-    def __init__(self, pattern_str, flags=0, error=None):
+    def __init__(self, pattern_str, flags=0, **kwargs):
         self._pattern_str = pattern_str
         flags_list = [Regex.NAMES[i] for i, f in enumerate("{0:09b}".format(flags)) if f != "0"]  # Name for each bit
 
@@ -523,10 +684,15 @@ class Regex(Schema):
             self._flags_names = ""
 
         self._pattern = re.compile(pattern_str, flags=flags)
-        self._error = error
+        super(Regex, self).__init__(pattern_str, **kwargs)
 
     def __repr__(self):
         return "%s(%r%s)" % (self.__class__.__name__, self._pattern_str, self._flags_names)
+
+    @property
+    def pattern_str(self):
+        """The pattern for the represented regular expression"""
+        return self._pattern_str
 
     def validate(self, data):
         """
@@ -542,6 +708,12 @@ class Regex(Schema):
             raise SchemaError("%r does not match %r" % (self, data), e)
         except TypeError:
             raise SchemaError("%r is not string nor buffer" % data, e)
+
+    @filter_refs
+    def _json_schema_(self, **kwargs):
+        result = super(Regex, self)._json_schema_.__wrapped__(self, **kwargs)
+        result.update({"type": "string", "pattern": self.pattern_str})
+        return result
 
 
 class Use(Schema):
@@ -576,6 +748,8 @@ def _priority(s):
         return DICT
     if issubclass(type(s), type):
         return TYPE
+    if isinstance(s, Literal):
+        return COMPARABLE
     if hasattr(s, "validate"):
         return VALIDATOR
     if callable(s):
@@ -601,7 +775,7 @@ class Optional(Schema):
                     '"%r" is too complex.' % (self._schema,)
                 )
             self.default = default
-            self.key = self._schema
+            self.key = str(self._schema)
 
     def __hash__(self):
         return hash(self._schema)
@@ -633,6 +807,17 @@ class Forbidden(Hook):
     @staticmethod
     def _default_function(nkey, data, error):
         raise SchemaForbiddenKeyError("Forbidden key encountered: %r in %r" % (nkey, data), error)
+
+
+class Literal(Value):
+    def __init__(self, value, description=None):
+        super(Literal, self).__init__(value, description=description)
+
+    def __str__(self):
+        return str(self._schema)
+
+    def __repr__(self):
+        return 'Literal("' + str(self.schema) + '", description="' + (self.description or "") + '")'
 
 
 class Const(Schema):

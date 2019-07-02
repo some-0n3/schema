@@ -1,6 +1,7 @@
 from __future__ import with_statement
 
 import copy
+import json
 import os
 import platform
 import re
@@ -16,6 +17,7 @@ from schema import (
     Const,
     Forbidden,
     Hook,
+    Literal,
     Optional,
     Or,
     Regex,
@@ -42,6 +44,21 @@ def ve(_):
 
 def se(_):
     raise SchemaError("first auto", "first error")
+
+
+def sorted_dict(to_sort):
+    """Helper function to sort list of string inside dictionaries in order to compare them"""
+    if isinstance(to_sort, dict):
+        new_dict = {}
+        for k in sorted(to_sort.keys()):
+            new_dict[k] = sorted_dict(to_sort[k])
+        return new_dict
+    if isinstance(to_sort, list) and to_sort:
+        if isinstance(to_sort[0], str):
+            return sorted(to_sort)
+        else:
+            return [sorted_dict(element) for element in to_sort]
+    return to_sort
 
 
 def test_schema():
@@ -683,11 +700,29 @@ def test_inheritance():
     assert d["k"] == 2 and d["d"]["k"] == 3 and d["d"]["l"][0]["l"] == [4, 5, 6]
 
 
+def test_literal_repr():
+    assert repr(Literal("test", description="testing")) == 'Literal("test", description="testing")'
+    assert repr(Literal("test")) == 'Literal("test", description="")'
+
+
 def test_json_schema():
     s = Schema({"test": str})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
+        "properties": {"test": {"type": "string"}},
+        "required": ["test"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_with_title():
+    s = Schema({"test": str}, name="Testing a schema")
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "title": "Testing a schema",
         "properties": {"test": {"type": "string"}},
         "required": ["test"],
         "additionalProperties": False,
@@ -706,7 +741,7 @@ def test_json_schema_types():
     )
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {
             "test_str": {"type": "string"},
             "test_int": {"type": "integer"},
@@ -719,11 +754,24 @@ def test_json_schema_types():
     }
 
 
+def test_json_schema_other_types():
+    """Test that data types not supported by JSON schema are returned as strings"""
+    s = Schema({Optional("test_other"): bytes})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"test_other": {"type": "string"}},
+        "required": [],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
 def test_json_schema_nested():
     s = Schema({"test": {"other": str}}, ignore_extra_keys=True)
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {
             "test": {
                 "type": "object",
@@ -742,7 +790,7 @@ def test_json_schema_nested_schema():
     s = Schema({"test": Schema({"other": str}, ignore_extra_keys=True)})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {
             "test": {
                 "type": "object",
@@ -761,7 +809,7 @@ def test_json_schema_optional_key():
     s = Schema({Optional("test"): str})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {"test": {"type": "string"}},
         "required": [],
         "additionalProperties": False,
@@ -773,7 +821,7 @@ def test_json_schema_optional_key_nested():
     s = Schema({"test": {Optional("other"): str}})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {
             "test": {
                 "type": "object",
@@ -792,8 +840,60 @@ def test_json_schema_or_key():
     s = Schema({Or("test1", "test2"): str})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {"test1": {"type": "string"}, "test2": {"type": "string"}},
+        "required": [],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_or_values():
+    s = Schema({"param": Or("test1", "test2")})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"param": {"enum": ["test1", "test2"]}},
+        "required": ["param"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_or_values_nested():
+    s = Schema({"param": Or([str], [list])})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {
+            "param": {
+                "anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "array", "items": {"type": "array"}}]
+            }
+        },
+        "required": ["param"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_or_values_with_optional():
+    s = Schema({Optional("whatever"): Or("test1", "test2")})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"whatever": {"enum": ["test1", "test2"]}},
+        "required": [],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_regex():
+    s = Schema({Optional("username"): Regex("[a-zA-Z][a-zA-Z0-9]{3,}")})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"username": {"type": "string", "pattern": "[a-zA-Z][a-zA-Z0-9]{3,}"}},
         "required": [],
         "additionalProperties": False,
         "type": "object",
@@ -804,7 +904,7 @@ def test_json_schema_or_types():
     s = Schema({"test": Or(str, int)})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {"test": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
         "required": ["test"],
         "additionalProperties": False,
@@ -817,8 +917,20 @@ def test_json_schema_and_types():
     s = Schema({"test": And(str, lambda x: len(x) < 5)})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
-        "properties": {"test": {}},
+        "$id": "my-id",
+        "properties": {"test": {"allOf": [{"type": "string"}]}},
+        "required": ["test"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_or_one_value():
+    s = Schema({"test": Or(True)})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"test": {"const": True}},
         "required": ["test"],
         "additionalProperties": False,
         "type": "object",
@@ -831,13 +943,13 @@ def test_json_schema_object_or_array_of_object():
     s = Schema({"test": Or(o, [o])})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {
             "test": {
                 "anyOf": [
                     {
                         "additionalProperties": False,
-                        "properties": {"param1": {}, "param2": {}},
+                        "properties": {"param1": {"const": "test1"}, "param2": {"const": "test2"}},
                         "required": ["param1"],
                         "type": "object",
                     },
@@ -845,7 +957,7 @@ def test_json_schema_object_or_array_of_object():
                         "type": "array",
                         "items": {
                             "additionalProperties": False,
-                            "properties": {"param1": {}, "param2": {}},
+                            "properties": {"param1": {"const": "test1"}, "param2": {"const": "test2"}},
                             "required": ["param1"],
                             "type": "object",
                         },
@@ -859,11 +971,37 @@ def test_json_schema_object_or_array_of_object():
     }
 
 
+def test_json_schema_and_simple():
+    s = Schema({"test1": And(str, "test2")})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {"test1": {"allOf": [{"type": "string"}, {"const": "test2"}]}},
+        "required": ["test1"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_and_list():
+    s = Schema({"param1": And(["choice1", "choice2"], list)})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {
+            "param1": {"allOf": [{"type": "array", "items": {"enum": ["choice1", "choice2"]}}, {"type": "array"}]}
+        },
+        "required": ["param1"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
 def test_json_schema_forbidden_key_ignored():
     s = Schema({Forbidden("forbidden"): str, "test": str})
     assert s.json_schema("my-id") == {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "id": "my-id",
+        "$id": "my-id",
         "properties": {"test": {"type": "string"}},
         "required": ["test"],
         "additionalProperties": False,
@@ -871,16 +1009,347 @@ def test_json_schema_forbidden_key_ignored():
     }
 
 
-def test_json_schema_no_id():
-    s = Schema({"test": int})
-    with raises(ValueError):
-        s.json_schema()
-
-
 def test_json_schema_not_a_dict():
     s = Schema(int)
     with raises(ValueError):
-        s.json_schema()
+        s.json_schema("my-id")
+
+
+def test_json_schema_dict_type():
+    json_schema = Schema({Optional("test1", default={}): dict}).json_schema("my-id")
+
+    assert json_schema == {
+        "type": "object",
+        "properties": {"test1": {"type": "object"}},
+        "required": [],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
+
+
+def test_json_schema_title_and_description():
+    s = Schema(
+        {Literal("productId", description="The unique identifier for a product"): int},
+        name="Product",
+        description="A product in the catalog",
+    )
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "title": "Product",
+        "description": "A product in the catalog",
+        "properties": {"productId": {"description": "The unique identifier for a product", "type": "integer"}},
+        "required": ["productId"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_description_nested():
+    s = Schema({Optional(Literal("test1", description="A description here"), default={}): Or([str], [list])})
+    assert s.json_schema("my-id") == {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-id",
+        "properties": {
+            "test1": {
+                "description": "A description here",
+                "anyOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"items": {"type": "array"}, "type": "array"},
+                ],
+            }
+        },
+        "required": [],
+        "additionalProperties": False,
+        "type": "object",
+    }
+
+
+def test_json_schema_description_or_nested():
+    s = Schema(
+        {
+            Optional(
+                Or(Literal("test1", description="A description here"), Literal("test2", description="Another"))
+            ): Or([str], [list])
+        }
+    )
+    assert s.json_schema("my-id") == {
+        "type": "object",
+        "properties": {
+            "test1": {
+                "description": "A description here",
+                "anyOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"items": {"type": "array"}, "type": "array"},
+                ],
+            },
+            "test2": {
+                "description": "Another",
+                "anyOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"items": {"type": "array"}, "type": "array"},
+                ],
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
+
+
+def test_json_schema_literal_with_enum():
+    s = Schema(
+        {
+            Literal("test", description="A test"): Or(
+                Literal("literal1", description="A literal with description"),
+                Literal("literal2", description="Another literal with description"),
+            )
+        }
+    )
+    assert s.json_schema("my-id") == {
+        "type": "object",
+        "properties": {"test": {"description": "A test", "enum": ["literal1", "literal2"]}},
+        "required": ["test"],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
+
+
+def test_json_schema_description_and_nested():
+    s = Schema(
+        {
+            Optional(
+                Or(Literal("test1", description="A description here"), Literal("test2", description="Another"))
+            ): And([str], [list])
+        }
+    )
+    assert s.json_schema("my-id") == {
+        "type": "object",
+        "properties": {
+            "test1": {
+                "description": "A description here",
+                "allOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"items": {"type": "array"}, "type": "array"},
+                ],
+            },
+            "test2": {
+                "description": "Another",
+                "allOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"items": {"type": "array"}, "type": "array"},
+                ],
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
+
+
+def test_description():
+    s = Schema({Optional(Literal("test1", description="A description here"), default={}): dict})
+    assert s.validate({"test1": {}})
+
+
+def test_description_with_default():
+    s = Schema({Optional(Literal("test1", description="A description here"), default={}): dict})
+    assert s.validate({}) == {"test1": {}}
+
+
+def test_json_schema_refs():
+    s = Schema({"test1": str, "test2": str, "test3": str})
+    hashed = "#" + str(hash(repr(sorted({"type": "string"}.items()))))
+    generated_json_schema = s.json_schema("my-id", use_refs=True)
+
+    # The order can change, so let's check indirectly
+    assert generated_json_schema["type"] == "object"
+    assert sorted(generated_json_schema["required"]) == ["test1", "test2", "test3"]
+    assert generated_json_schema["additionalProperties"] is False
+    assert generated_json_schema["$id"] == "my-id"
+    assert generated_json_schema["$schema"] == "http://json-schema.org/draft-07/schema#"
+
+    # There will be one of the property being the id and 2 referencing it, but which one is random
+    id_schema_part = {"type": "string", "$id": hashed}
+    ref_schema_part = {"$ref": hashed}
+
+    nb_id_schema = 0
+    nb_ref_schema = 0
+    for v in generated_json_schema["properties"].values():
+        if v == id_schema_part:
+            nb_id_schema += 1
+        elif v == ref_schema_part:
+            nb_ref_schema += 1
+    assert nb_id_schema == 1
+    assert nb_ref_schema == 2
+
+
+def test_json_schema_refs_is_smaller():
+    key_names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t"]
+    key_values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "value1", "value2", "value3", "value4", "value5", None]
+    s = Schema({Literal(Or(*key_names), description="A key that can have many names"): key_values})
+    assert len(json.dumps(s.json_schema("my-id", use_refs=False))) > len(
+        json.dumps(s.json_schema("my-id", use_refs=True))
+    )
+
+
+def test_json_schema_refs_no_missing():
+    key_names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t"]
+    key_values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "value1", "value2", "value3", "value4", "value5", None]
+    s = Schema({Literal(Or(*key_names), description="A key that can have many names"): key_values})
+    json_s = s.json_schema("my-id", use_refs=True)
+    schema_ids = []
+    refs = []
+
+    def _get_ids_and_refs(schema_dict):
+        for k, v in schema_dict.items():
+            if isinstance(v, dict):
+                _get_ids_and_refs(v)
+                continue
+
+            if k == "$id" and v != "my-id":
+                schema_ids.append(v)
+            elif k == "$ref":
+                refs.append(v)
+
+    _get_ids_and_refs(json_s)
+
+    # No ID is repeated
+    assert len(schema_ids) == len(set(schema_ids))
+
+    # All IDs are used in a ref
+    for schema_id in schema_ids:
+        assert schema_id in refs
+
+    # All refs have an associated ID
+    for ref in refs:
+        assert ref in schema_ids
+
+
+def test_json_schema_definitions():
+    sub_schema = Schema({"sub_key1": int}, name="sub_schema", as_reference=True)
+    main_schema = Schema({"main_key1": str, "main_key2": sub_schema})
+
+    json_schema = main_schema.json_schema("my-id")
+    assert sorted_dict(json_schema) == {
+        "type": "object",
+        "properties": {"main_key1": {"type": "string"}, "main_key2": {"$ref": "#/definitions/sub_schema"}},
+        "required": ["main_key1", "main_key2"],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+            "sub_schema": {
+                "type": "object",
+                "properties": {"sub_key1": {"type": "integer"}},
+                "required": ["sub_key1"],
+                "additionalProperties": False,
+            }
+        },
+    }
+
+
+def test_json_schema_definitions_and_literals():
+    sub_schema = Schema({Literal("sub_key1", description="Sub key 1"): int}, name="sub_schema", as_reference=True)
+    main_schema = Schema(
+        {Literal("main_key1", description="Main key 1"): str, Literal("main_key2", description="main_key2"): sub_schema}
+    )
+
+    json_schema = main_schema.json_schema("my-id")
+    assert sorted_dict(json_schema) == {
+        "type": "object",
+        "properties": {
+            "main_key1": {"description": "Main key 1", "type": "string"},
+            "main_key2": {"description": "main_key2", "$ref": "#/definitions/sub_schema"},
+        },
+        "required": ["main_key1", "main_key2"],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+            "sub_schema": {
+                "type": "object",
+                "properties": {"sub_key1": {"description": "Sub key 1", "type": "integer"}},
+                "required": ["sub_key1"],
+                "additionalProperties": False,
+            }
+        },
+    }
+
+
+def test_json_schema_definitions_nested():
+    sub_sub_schema = Schema({"sub_sub_key1": int}, name="sub_sub_schema", as_reference=True)
+    sub_schema = Schema({"sub_key1": int, "sub_key2": sub_sub_schema}, name="sub_schema", as_reference=True)
+    main_schema = Schema({"main_key1": str, "main_key2": sub_schema})
+
+    json_schema = main_schema.json_schema("my-id")
+    assert sorted_dict(json_schema) == {
+        "type": "object",
+        "properties": {"main_key1": {"type": "string"}, "main_key2": {"$ref": "#/definitions/sub_schema"}},
+        "required": ["main_key1", "main_key2"],
+        "additionalProperties": False,
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+            "sub_schema": {
+                "type": "object",
+                "properties": {"sub_key1": {"type": "integer"}, "sub_key2": {"$ref": "#/definitions/sub_sub_schema"}},
+                "required": ["sub_key1", "sub_key2"],
+                "additionalProperties": False,
+            },
+            "sub_sub_schema": {
+                "type": "object",
+                "properties": {"sub_sub_key1": {"type": "integer"}},
+                "required": ["sub_sub_key1"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def test_json_schema_definitions_recursive():
+    """Create a JSON schema with an object that refers to itself
+
+    This is the example from here: https://json-schema.org/understanding-json-schema/structuring.html#recursion
+    """
+    from schema import Iterable
+
+    children = []
+    person = Schema({Optional("name"): str, Optional("children"): children}, name="person", as_reference=True)
+    if isinstance(person._sorted[1][2], Iterable):
+        subschema = person._sorted[1][2]
+    else:
+        subschema = person._sorted[0][2]
+    subschema._elem_sub._schema_seq.append(person)
+    subschema._elem_sub._args = (person,)
+
+    json_schema = person.json_schema("my-id")
+    assert json_schema == {
+        "$ref": "#/definitions/person",
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "person",
+        "definitions": {
+            "person": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "children": {"type": "array", "items": {"$ref": "#/definitions/person"}},
+                },
+                "required": [],
+                "additionalProperties": False,
+            }
+        },
+    }
+
+
+def test_json_schema_definitions_invalid():
+    with raises(ValueError):
+        _ = Schema({"test1": str}, as_reference=True)
 
 
 def test_prepend_schema_name():
